@@ -1,20 +1,83 @@
 const Core = require('./core');
-function request(path, data, method) {
-  const config=getApp().globalData;
-  if(!/^https:\/\//.test(config.apiBase)) return Promise.reject(new Error('请配置已备案且加入合法域名的 HTTPS 服务端地址'));
-  return new Promise((resolve,reject)=>wx.request({url:config.apiBase.replace(/\/$/,'')+path,method:method||'GET',data,timeout:12000,
-    success(res){if(res.statusCode>=200&&res.statusCode<300)resolve(res.data);else reject(new Error((res.data.error&&res.data.error.message)||'服务暂时不可用，请稍后重试'));},
-    fail(){reject(new Error('网络连接失败，请检查网络后重试'));}
+
+function isDevTools() {
+  const info = typeof wx.getDeviceInfo === 'function'
+    ? wx.getDeviceInfo()
+    : wx.getSystemInfoSync();
+  return info.platform === 'devtools';
+}
+
+function request(config, path, data, method = 'GET') {
+  const base = (config.apiBase || '').replace(/\/+$/, '');
+  const localDemo = config.useDemoData && config.useDemoApi &&
+    /^http:\/\/(?:127\.0\.0\.1|localhost)(?::[0-9]{1,5})?$/.test(base) && isDevTools();
+  if (!localDemo && !/^https:\/\/[^/\s?#]+(?:\/[^?#]*)?$/.test(base)) {
+    return Promise.reject(new Error('请配置合法请求域名的 HTTPS 服务地址。本机 HTTP 仅用于开发者工具的演示联调。'));
+  }
+  const expectedMode = config.useDemoData ? 'demo' : 'live';
+  return new Promise((resolve, reject) => wx.request({
+    url: base + path,
+    method,
+    data,
+    header: { 'content-type': 'application/json' },
+    timeout: 12000,
+    success(res) {
+      const result = res.data;
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        const message = result && result.error && result.error.message;
+        reject(new Error(message || '服务暂时不可用，请稍后重试'));
+        return;
+      }
+      if (!result || result.mode !== expectedMode) {
+        reject(new Error(expectedMode === 'demo'
+          ? '服务端没有返回可用的演示数据'
+          : '服务端尚未开放真实联盟服务'));
+        return;
+      }
+      resolve(result);
+    },
+    fail() {
+      reject(new Error('网络连接失败，请检查服务地址和开发工具的网络设置'));
+    }
   }));
 }
-function present(p){return Object.assign({},p,{priceLabel:Core.money(Core.finalPrice(p)),couponLabel:Core.money(p.couponFen),originalLabel:Core.money(p.priceFen),platformName:Core.platformNames[p.platform],imagePath:p.imageUrl||'/assets/'+p.image+'.png'});}
-function requireLive(r){if(r.mode!=='live')throw new Error('服务端仍处于演示模式，尚未开放真实联盟服务');return r;}
-module.exports={
+
+function present(p) {
+  return Object.assign({}, p, {
+    priceLabel: Core.money(Core.finalPrice(p)),
+    couponLabel: Core.money(p.couponFen),
+    originalLabel: Core.money(p.priceFen),
+    platformName: Core.platformNames[p.platform],
+    imagePath: p.imageUrl || '/assets/' + p.image + '.png'
+  });
+}
+
+module.exports = {
   present,
-  products(filters){if(getApp().globalData.useDemoData)return Promise.resolve({mode:'demo',items:Core.filterProducts(filters).map(present)});return request('/api/products',filters).then(requireLive).then(r=>Object.assign({},r,{items:r.items.map(present)}));},
-  convert(text){
-    if(!getApp().globalData.useDemoData)return request('/api/convert',{text},'POST').then(requireLive).then(r=>Object.assign({},r,{product:r.product?present(r.product):null}));
-    const r=Core.analyze(text);if(r.error)return Promise.reject(new Error(r.error));
-    return Promise.resolve({mode:'demo',platform:r.platform,kind:r.kind,product:r.demoProduct?present(r.demoProduct):null,promotion:null,status:r.demoProduct?'DEMO_RESULT':'UPSTREAM_NOT_CONNECTED'});
+  async products(filters) {
+    const config = getApp().globalData;
+    if (config.useDemoData && !config.useDemoApi) {
+      return { mode: 'demo', items: Core.filterProducts(filters).map(present) };
+    }
+    const result = await request(config, '/api/products', filters);
+    if (!Array.isArray(result.items)) throw new Error('商品接口没有返回列表');
+    return Object.assign({}, result, { items: result.items.map(present) });
+  },
+  async convert(text) {
+    const config = getApp().globalData;
+    if (!config.useDemoData || config.useDemoApi) {
+      const result = await request(config, '/api/convert', { text }, 'POST');
+      return Object.assign({}, result, { product: result.product ? present(result.product) : null });
+    }
+    const result = Core.analyze(text);
+    if (result.error) throw new Error(result.error);
+    return {
+      mode: 'demo',
+      platform: result.platform,
+      kind: result.kind,
+      product: result.demoProduct ? present(result.demoProduct) : null,
+      promotion: null,
+      status: result.demoProduct ? 'DEMO_RESULT' : 'UPSTREAM_NOT_CONNECTED'
+    };
   }
 };

@@ -1,0 +1,10 @@
+services:
+  quansheng:
+    image: "${QUANSHENG_IMAGE:?QUANSHENG_IMAGE is required}"
+    pull_policy: never
+    environment:
+      AFFILIATE_MODE: demo
+      PORT: "3000"
+    ports:
+      - "127.0.0.1:${QUANSHENG_PORT:-3000}:3000"
+    restart: unless-stopped

@@ -3,3 +3,4 @@ node_modules
 .env
 *.zip
 project.private.config.json
+build-artifacts
