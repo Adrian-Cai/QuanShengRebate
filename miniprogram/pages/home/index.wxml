@@ -1,0 +1,16 @@
+<view class="page">
+  <view class="brand-row"><view class="brand"><image src="/assets/logo.png"/>券省</view><button class="guide" bindtap="guide">领券指南 ↗</button></view>
+  <view class="hero"><text class="kicker">把日子过好，把钱花巧</text><view class="hero-title">每一次心动，<view>都可以<text>更划算。</text></view></view><view class="hero-note">先来券省查一查，好价一起装进口袋。</view><image class="hero-art" src="/assets/kettle.png" mode="aspectFit"/></view>
+  <view class="search"><input value="{{query}}" bindinput="onInput" bindconfirm="search" confirm-type="search" maxlength="2000" placeholder="搜商品，或粘贴商品链接"/><button bindtap="search">查券省钱 →</button></view>
+  <view class="platform-line">淘宝联盟 <text>·</text> 京东联盟 <text>·</text> 多多进宝</view>
+  <view class="steps"><view><text>01</text>复制链接</view><text>→</text><view><text>02</text>查券转链</view><text>→</text><view><text>03</text>回平台下单</view></view>
+  <view class="heading"><text class="kicker">THE EDIT</text><view>今天，省一点好生活 <text>✳</text></view></view>
+  <view class="scenes"><button class="scene peach" bindtap="scene" data-id="daily"><text>日常囤货</text><view>小预算，<view>大满足。</view></view><image src="/assets/tissue.png" mode="aspectFit"/></button><button class="scene sage" bindtap="scene" data-id="home"><text>品质居家</text><view>宅家也有<view>幸福感。</view></view><image src="/assets/lamp.png" mode="aspectFit"/></button><button class="scene lilac" bindtap="scene" data-id="digital"><text>通勤好物</text><view>好搭子，<view>刚刚好。</view></view><image src="/assets/headphones.png" mode="aspectFit"/></button></view>
+  <view class="heading"><text class="kicker">LITTLE FINDS, BIG JOY</text><view>值得入手的好物</view></view><view class="sample" wx:if="{{demo}}">演示商品 · 示例价格与优惠，不用于真实购物</view>
+  <view class="platform-tabs"><button wx:for="{{platforms}}" wx:key="id" data-id="{{item.id}}" bindtap="platform" class="{{platform===item.id?'active':''}}">{{item.name}}</button></view>
+  <scroll-view scroll-x class="categories"><button wx:for="{{categories}}" wx:key="id" data-id="{{item.id}}" bindtap="category" class="{{category===item.id?'active':''}}">{{item.name}}</button></scroll-view>
+  <view class="muted loading" wx:if="{{loading}}">正在找好物…</view><view class="error" wx:if="{{error}}">{{error}}<button bindtap="loadProducts">重试</button></view>
+  <view class="grid" wx:if="{{!loading}}"><button class="product" wx:for="{{products}}" wx:key="id" data-id="{{item.id}}" bindtap="product"><view class="product-image" style="background:{{item.bg}}"><text>{{item.tag}}</text><image src="{{item.imagePath}}" mode="aspectFit"/></view><view class="product-body"><view class="store platform-{{item.platform}}">{{item.platformName}} · {{item.store}}</view><view class="product-title">{{item.title}}</view><view class="coupon">券 ¥{{item.couponLabel}}</view><view class="price-row"><text class="price">¥{{item.priceLabel}}</text><text class="after">券后</text><text class="old">¥{{item.originalLabel}}</text></view><view class="buy">领券预览 ↗</view></view></button></view>
+  <view wx:if="{{!loading &amp;&amp; !products.length &amp;&amp; !error}}" class="empty">暂时没有找到，换个关键词试试。</view>
+  <view class="demo-note" wx:if="{{demo}}">当前为交互演示。接入联盟应用并完成小程序审核后，才可展示真实优惠并跳转购买。</view>
+</view>

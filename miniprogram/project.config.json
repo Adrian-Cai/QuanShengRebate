@@ -1,0 +1,8 @@
+{
+  "description": "券省微信小程序：双 Tab 交互起步工程。默认使用示例数据，未连接联盟。",
+  "projectname": "quansheng-mini",
+  "appid": "touristappid",
+  "compileType": "miniprogram",
+  "miniprogramRoot": "./",
+  "setting": {"es6":true,"enhance":true,"minified":true,"urlCheck":true}
+}

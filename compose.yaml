@@ -1,0 +1,9 @@
+services:
+  quansheng:
+    build:
+      context: .
+    environment:
+      AFFILIATE_MODE: demo
+      PORT: "3000"
+    ports:
+      - "127.0.0.1:3000:3000"
