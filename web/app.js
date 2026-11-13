@@ -1,132 +1,202 @@
+/**
+ * 职责：网页交互层 —— 请求 /api/v1/products 渲染淘宝联盟真实商品，处理分页、筛选、搜索、
+ *       空/错/超时分区、商品详情、历史记录与仅识别平台的转链占位页。
+ * 边界：不含任何内置商品数据；不伪造推广链接或购买入口；正式转链 /api/v1/conversions 本次范围外。
+ * 调用方：web/index.html（defer 加载），同源 Node 服务提供数据。
+ * 关键点：goodsJob / convertJob 竞态控制保留；金额由 web/core.js 的 formatMoney/priceView 统一处理；
+ *         上游失败按错误码分区提示，绝不回退到任何离线兜底数据；fixture 数据源在页面上显著标注。
+ */
 (() => {
   'use strict';
-  const C=window.CouponCore;
-  const $=s=>document.querySelector(s);
-  const $$=s=>[...document.querySelectorAll(s)];
-  const state={platform:'all',category:'all',query:'',sort:'recommend'};
-  const labels={taobao:'淘',jd:'京',pdd:'拼'};
-  const classes={taobao:'tb',jd:'jd',pdd:'pdd'};
-  const offlinePreview = location.protocol === 'file:';
+  const C = window.CouponCore;
+  const $ = s => document.querySelector(s);
+  const $$ = s => [...document.querySelectorAll(s)];
+  const state = { platform: 'all', category: 'all', query: '', sort: 'recommend' };
+  const labels = { taobao: '淘', jd: '京', pdd: '拼' };
+  const classes = { taobao: 'tb', jd: 'jd', pdd: 'pdd' };
+  const HISTORY_KEY = 'quansheng.history.v2';
+
+  const ERROR_TEXT = {
+    UPSTREAM_TIMEOUT: '淘宝联盟接口响应超时，请稍后重试。',
+    UPSTREAM_RATE_LIMITED: '淘宝联盟接口调用过于频繁，请稍后再试。',
+    UPSTREAM_PERMISSION_MISSING: '服务端尚未配置完整的淘宝联盟凭据或权限，商品暂不可用，请联系管理员。',
+    UPSTREAM_ERROR: '淘宝联盟接口暂时不可用，请稍后重试。',
+    PLATFORM_NOT_ENABLED: '该平台尚未开放，当前仅接入淘宝联盟。',
+    INVALID_CURSOR: '分页信息已失效，请重新查询。'
+  };
+
   let toastTimer;
   let convertJob = 0;
   let goodsJob = 0;
   let visibleProducts = [];
+  let nextCursor = null;
+  let dataSource = null;
 
-  async function requestDemo(path, options = {}) {
+  class ApiError extends Error {
+    constructor(code, message, retryable = true) {
+      super(message);
+      this.code = code;
+      this.retryable = retryable;
+    }
+  }
+
+  async function requestApi(path, options = {}) {
     let response;
     try {
-      response = await fetch(path, { ...options, signal: AbortSignal.timeout?.(10000) });
+      response = await fetch(path, { ...options, signal: AbortSignal.timeout(12000) });
     } catch (error) {
-      throw new Error(error.name === 'TimeoutError' ? '接口请求超时，请重试。' : '无法连接演示服务，请检查服务是否启动。');
+      const timeout = error && error.name === 'TimeoutError';
+      throw new ApiError(timeout ? 'UPSTREAM_TIMEOUT' : 'NETWORK',
+        timeout ? '接口请求超时，请稍后重试。' : '无法连接服务，请先运行 npm start 并访问 http://localhost:3000。');
     }
-
     const data = await response.json().catch(() => null);
     if (!response.ok) {
-      throw new Error(data?.error?.message || `接口请求失败（HTTP ${response.status}）。`);
+      const code = (data && data.error && data.error.code) || 'UNKNOWN';
+      throw new ApiError(code, ERROR_TEXT[code] || (data && data.error && data.error.message) || `接口请求失败（HTTP ${response.status}）。`,
+        code !== 'INVALID_INPUT' && code !== 'INVALID_CURSOR');
     }
-    if (data?.mode !== 'demo') {
-      throw new Error('接口没有返回可用的演示数据。');
-    }
+    if (!data || data.mode !== 'live') throw new ApiError('BAD_MODE', '接口没有返回正式模式的数据。');
     return data;
   }
 
-  function productImage(product) {
-    const name = typeof product.image === 'string' && /^[a-z0-9-]+$/i.test(product.image)
-      ? product.image : 'logo';
-    return `assets/${name}.svg`;
-  }
-
-  async function loadGoods(filters) {
-    if (offlinePreview) return C.filterProducts(filters);
-    const result = await requestDemo(`/api/products?${new URLSearchParams(filters)}`);
-    if (!Array.isArray(result.items)) throw new Error('商品接口没有返回列表。');
-    return result.items;
-  }
-
-  async function convertLink(text) {
-    if (offlinePreview) {
-      const result = C.analyze(text);
-      if (result.error) throw new Error(result.error);
-      return {
-        ...result,
-        product: result.demoProduct,
-        status: result.demoProduct ? 'DEMO_RESULT' : 'UPSTREAM_NOT_CONNECTED'
-      };
-    }
-
-    const result = await requestDemo('/api/convert', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text })
-    });
-    if (!Object.hasOwn(C.platformNames, result.platform) ||
-        (result.status !== 'DEMO_RESULT' && result.status !== 'UPSTREAM_NOT_CONNECTED')) {
-      throw new Error('转链接口没有返回可用的结果。');
-    }
-    if (result.status === 'DEMO_RESULT' && !result.product) {
-      throw new Error('转链接口没有返回示例商品。');
-    }
+  async function loadGoods(cursor) {
+    const params = { platform: state.platform, sort: state.sort, limit: '20' };
+    if (state.query) params.query = state.query;
+    else if (state.category !== 'all') params.category = state.category;
+    if (cursor) params.cursor = cursor;
+    const result = await requestApi(`/api/v1/products?${new URLSearchParams(params)}`);
+    if (!Array.isArray(result.items)) throw new ApiError('BAD_SHAPE', '商品接口没有返回列表。');
     return result;
   }
-  const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  const badge=p=>`<i class="platform-icon ${classes[p]}">${labels[p]}</i>`;
-  const price=p=>`<span class="price"><small>¥</small>${C.money(C.finalPrice(p))}</span><span class="after-coupon">券后</span><span class="original-price">¥${C.money(p.priceFen)}</span>`;
-  const coupon=p=>`<span class="coupon-badge"><span>券</span><b>¥${C.money(p.couponFen)}</b></span>`;
-  function toast(message){clearTimeout(toastTimer);$('#toast').textContent=message;$('#toast').hidden=false;toastTimer=setTimeout(()=>$('#toast').hidden=true,3200);}
-  function showDialog(title,html){$('#dialog-kicker').textContent=title;$('#dialog-content').innerHTML=html;$('#dialog').showModal();}
-  function guide(){showDialog('QUANSHENG / 领券指南','<h2>先领券，再下单。</h2><ol><li><b>复制链接</b><br>从淘宝、京东或拼多多复制商品分享链接。</li><li><b>查券与转链</b><br>平台查询可用优惠，再通过联盟接口生成带推广身份的链接。</li><li><b>回原平台购买</b><br>领取可用优惠后下单。付款、物流与售后均在原购物平台完成。</li></ol><p>不是每件商品都有券，价格、优惠与资格以平台结算页为准。平台可从有效推广订单中获得佣金。</p><p>当前页面是交互原型，商品、价格、优惠与结果均为示例，尚未接入任何联盟账号；不能产生真实推广订单。</p>');}
-  async function renderGoods() {
+
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const badge = p => `<i class="platform-icon ${classes[p] || 'tb'}">${labels[p] || '淘'}</i>`;
+
+  function basisChip(item) {
+    const map = {
+      CONFIRMED: ['到手价已确认', 'confirmed'],
+      ESTIMATED: ['预估价 · 含条件', 'estimated'],
+      UNKNOWN: ['到手价未知', 'unknown']
+    };
+    const [text, kind] = map[item.priceBasis] || map.UNKNOWN;
+    return `<span class="price-basis ${kind}">${text}</span>`;
+  }
+
+  function couponHtml(item) {
+    const view = C.couponView(item);
+    if (!view.amount) return `<span class="coupon-badge coupon-none">${esc(view.text)}</span>`;
+    const conditions = view.conditions.length
+      ? `<span class="coupon-conditions">${esc(view.conditions.join(' · '))}</span>` : '';
+    return `<span class="coupon-badge"><span>券</span><b>¥${esc(view.amount)}</b></span>${conditions}`;
+  }
+
+  function cardHtml(item) {
+    const ref = esc(item.productRef);
+    const title = esc(item.title);
+    const view = C.priceView(item);
+    const image = esc(C.productImage(item));
+    return `
+      <article class="product-card">
+        <button class="product-image" data-product="${ref}" aria-label="查看${title}">
+          <img src="${image}" alt="${title}" loading="lazy" referrerpolicy="no-referrer">
+        </button>
+        <div class="product-content">
+          <div class="product-origin">${badge(item.platform)} ${item.store ? esc(item.store) : '淘宝联盟商品'}</div>
+          <button class="product-title" data-product="${ref}">${title}</button>
+          <div class="coupon-row">${couponHtml(item)}</div>
+          <div class="product-price-row">
+            <span class="price"><small>¥</small>${esc(view.display)}</span>
+            <span class="price-caption">${esc(view.caption)}</span>
+            ${view.showOriginal ? `<span class="original-price">¥${esc(view.original)}</span>` : ''}
+          </div>
+          ${basisChip(item)}
+          ${view.note ? `<p class="price-note">${esc(view.note)}</p>` : ''}
+          <div class="product-bottom"><span>淘宝联盟 · 实时</span><button class="detail-button" data-product="${ref}">查看详情 →</button></div>
+        </div>
+      </article>`;
+  }
+
+  function toast(message) {
+    clearTimeout(toastTimer);
+    $('#toast').textContent = message;
+    $('#toast').hidden = false;
+    toastTimer = setTimeout(() => { $('#toast').hidden = true; }, 3200);
+  }
+  function showDialog(title, html) {
+    $('#dialog-kicker').textContent = title;
+    $('#dialog-content').innerHTML = html;
+    $('#dialog').showModal();
+  }
+
+  function showGoodsError(error) {
+    const code = error.code || 'NETWORK';
+    const titles = {
+      UPSTREAM_TIMEOUT: '上游响应超时',
+      UPSTREAM_RATE_LIMITED: '上游限流',
+      UPSTREAM_PERMISSION_MISSING: '凭据或权限未就绪',
+      UPSTREAM_ERROR: '上游暂时不可用',
+      NETWORK: '无法连接服务',
+      PLATFORM_NOT_ENABLED: '平台未开放'
+    };
+    $('#goods-error').dataset.kind = code;
+    $('#goods-error-title').textContent = titles[code] || '商品加载失败';
+    $('#goods-error-message').textContent = error.message;
+    $('#goods-retry').hidden = !error.retryable;
+    $('#goods-error').hidden = false;
+  }
+
+  function syncFilters() {
+    for (const [selector, key] of [['[data-platform]', 'platform'], ['[data-category]', 'category']]) {
+      for (const button of $$(selector)) {
+        const active = button.dataset[key] === state[key];
+        button.classList.toggle('selected', active);
+        button.setAttribute('aria-pressed', String(active));
+      }
+    }
+    $('#clear-filter').hidden = state.platform === 'all' && state.category === 'all' && !state.query;
+    $('#sort-select').value = state.sort;
+  }
+
+  function showDataSourceNotice(result) {
+    const banner = $('#data-source-notice');
+    if (result.notice) {
+      banner.textContent = result.notice;
+      banner.hidden = false;
+    } else {
+      banner.hidden = true;
+    }
+  }
+
+  async function renderGoods({ append = false } = {}) {
     const job = ++goodsJob;
-    const filters = { ...state };
-    visibleProducts = [];
+    const cursor = append ? nextCursor : '';
+    if (append && !cursor) return;
     const grid = $('#product-grid');
-    grid.replaceChildren();
+    if (!append) { visibleProducts = []; nextCursor = null; grid.replaceChildren(); }
     grid.setAttribute('aria-busy', 'true');
     $('#goods-loading').hidden = false;
     $('#goods-error').hidden = true;
     $('#empty-state').hidden = true;
     $('#query-label').hidden = true;
-
-    for (const [selector, key] of [['[data-platform]', 'platform'], ['[data-category]', 'category']]) {
-      for (const button of $$(selector)) {
-        const active = button.dataset[key] === filters[key];
-        button.classList.toggle('selected', active);
-        button.setAttribute('aria-pressed', String(active));
-      }
-    }
-    $('#clear-filter').hidden = filters.platform === 'all' && filters.category === 'all' && !filters.query;
+    $('#load-more').hidden = true;
+    syncFilters();
 
     try {
-      const products = await loadGoods(filters);
+      const result = await loadGoods(cursor);
       if (job !== goodsJob) return;
-      grid.innerHTML = products.map(product => {
-        const id = esc(product.id);
-        const title = esc(product.title);
-        const background = /^#[0-9a-f]{6}$/i.test(product.bg) ? product.bg : '#f4efe5';
-        return `
-          <article class="product-card">
-            <button class="product-image" style="--product-bg:${background}" data-product="${id}" aria-label="查看${title}">
-              <span class="image-label">${esc(product.tag)}</span>
-              <img src="${productImage(product)}" alt="${title}示例插画" loading="lazy">
-            </button>
-            <div class="product-content">
-              <div class="product-origin">${badge(product.platform)} ${esc(product.store)}</div>
-              <button class="product-title" data-product="${id}">${title}</button>
-              <span class="product-subtitle">${esc(product.sub)}</span>
-              <div class="coupon-row">${coupon(product)}<span class="product-benefit">${esc(product.benefit)}</span></div>
-              <div class="product-price-row">${price(product)}</div>
-              <div class="product-bottom"><span>优惠示例</span><button class="buy-button" data-product="${id}">领券预览 ↗</button></div>
-            </div>
-          </article>`;
-      }).join('');
-      visibleProducts = products;
-      $('#empty-state').hidden = products.length !== 0;
-      $('#query-label').hidden = !filters.query;
-      $('#query-label').textContent = `搜索“${filters.query}” · ${products.length} 件示例好物`;
+      const incoming = Array.isArray(result.items) ? result.items : [];
+      visibleProducts = append ? visibleProducts.concat(incoming) : incoming.slice();
+      nextCursor = result.nextCursor || null;
+      dataSource = result.dataSource;
+      showDataSourceNotice(result);
+      grid.innerHTML += incoming.map(cardHtml).join('');
+      $('#empty-state').hidden = visibleProducts.length !== 0;
+      $('#query-label').hidden = !state.query;
+      if (state.query) $('#query-label').textContent = `搜索“${state.query}” · 当前 ${visibleProducts.length} 件商品`;
+      $('#load-more').hidden = !nextCursor;
     } catch (error) {
       if (job !== goodsJob) return;
-      $('#goods-error-message').textContent = error.message;
-      $('#goods-error').hidden = false;
+      showGoodsError(error);
     } finally {
       if (job === goodsJob) {
         $('#goods-loading').hidden = true;
@@ -134,18 +204,25 @@
       }
     }
   }
-  function route(){
-    const isConvert=location.hash==='#convert';
-    $('#home-page').hidden=isConvert;$('#convert-page').hidden=!isConvert;
-    $$('[data-nav]').forEach(el=>{const active=el.dataset.nav===(isConvert?'convert':'home');el.classList.toggle('active',active);if(active)el.setAttribute('aria-current','page');else el.removeAttribute('aria-current');});
-    document.title=isConvert?'链接查券 · 券省':'券省 · 先领券，再下单';
-    window.scrollTo({top:0,behavior:'instant'});
-    if(isConvert)renderHistory();
+
+  function route() {
+    const isConvert = location.hash === '#convert';
+    $('#home-page').hidden = isConvert;
+    $('#convert-page').hidden = !isConvert;
+    $$('[data-nav]').forEach(el => {
+      const active = el.dataset.nav === (isConvert ? 'convert' : 'home');
+      el.classList.toggle('active', active);
+      if (active) el.setAttribute('aria-current', 'page'); else el.removeAttribute('aria-current');
+    });
+    document.title = isConvert ? '链接查券 · 券省' : '券省 · 先领券，再下单';
+    window.scrollTo({ top: 0, behavior: 'instant' });
+    if (isConvert) renderHistory();
   }
+
   function resetConversion() {
     convertJob++;
     $('#convert-submit').disabled = false;
-    $('#convert-submit').innerHTML = '查找优惠，预览转链 <span>→</span>';
+    $('#convert-submit').innerHTML = '识别链接平台 <span>→</span>';
     $('#convert-result').hidden = true;
     $('#input-error').hidden = true;
     $('#link-input').removeAttribute('aria-invalid');
@@ -156,34 +233,103 @@
     resetConversion();
     if (location.hash !== '#convert') location.hash = 'convert';
   }
-  function productDetail(id){
-    const p=visibleProducts.find(p=>p.id===id);if(!p)return;
-    showDialog('好物预览 / 示例商品',`<img class="dialog-product-img" src="${productImage(p)}" alt="${esc(p.title)}示例插画"><div class="product-origin">${badge(p.platform)} ${esc(p.store)}</div><h2>${esc(p.title)}</h2><span class="product-subtitle">${esc(p.sub)}</span><div class="product-price-row">${price(p)}</div><div class="coupon-row">${coupon(p)}<span class="product-benefit">${esc(p.benefit)}</span></div><p>这是演示商品，价格与优惠仅用于体验。尚未生成真实领券链接。</p><button class="primary-button" id="product-convert">体验这件商品的转链流程 →</button>`);
-    $('#product-convert').onclick=()=>{$('#dialog').close();fillLink(C.exampleUrl(p));};
+
+  function detailHtml(item) {
+    const view = C.priceView(item);
+    return `<img class="dialog-product-img" src="${esc(C.productImage(item))}" alt="${esc(item.title)}" referrerpolicy="no-referrer">
+      <div class="product-origin">${badge(item.platform)} ${item.store ? esc(item.store) : '淘宝联盟商品'}</div>
+      <h2>${esc(item.title)}</h2>
+      <div class="product-price-row"><span class="price"><small>¥</small>${esc(view.display)}</span><span class="price-caption">${esc(view.caption)}</span>${view.showOriginal ? `<span class="original-price">¥${esc(view.original)}</span>` : ''}</div>
+      <div class="coupon-row">${couponHtml(item)}</div>
+      ${basisChip(item)}
+      <p class="dialog-note">${esc(view.note || '价格与优惠以淘宝联盟返回及平台结算页为准。')}</p>
+      <p class="dialog-note">商品引用：<code>${esc(item.productRef)}</code>。正式转链与领券购买入口（/api/v1/conversions）待接入，当前不提供可购买的推广链接。</p>`;
   }
-  function detect(){
-    const text=$('#link-input').value;const r=C.analyze(text);
-    $('#clear-link').hidden=!text;
-    $('#platform-detection').textContent=!text?'等待粘贴链接':r.error?'输入后点击查询':`已识别：${C.platformNames[r.platform]}${r.kind==='token'?'淘口令':''}`;
-    $('#platform-detection').classList.toggle('detected',!r.error);
+
+  function productDetail(ref) {
+    const item = visibleProducts.find(p => p.productRef === ref);
+    if (!item) { toast('该商品已不在当前列表中，请重新搜索。'); return; }
+    showDialog('商品详情 / 淘宝联盟', detailHtml(item));
+    saveHistory(item);
   }
-  function loadHistory(){try{const data=JSON.parse(localStorage.getItem('quansheng.history.v1')||'[]');return Array.isArray(data)?data.filter(i=>i&&C.products.some(p=>p.id===i.id)&&Number.isFinite(i.time)).slice(0,5):[];}catch{return [];}}
-  function saveHistory(p){try{const items=loadHistory().filter(i=>i.id!==p.id);items.unshift({id:p.id,time:Date.now()});localStorage.setItem('quansheng.history.v1',JSON.stringify(items.slice(0,5)));}catch{toast('浏览器未允许保存本地记录');}renderHistory();}
-  function renderHistory(){const list=loadHistory();$('#clear-history').hidden=!list.length;$('#history-list').innerHTML=list.length?list.map(i=>{const p=C.products.find(x=>x.id===i.id);return `<button class="history-row" data-history="${p.id}"><img src="assets/${p.image}.svg" alt=""><span><b>${esc(p.title)}</b><small>${C.platformNames[p.platform]} · 演示记录 · ${new Date(i.time).toLocaleDateString('zh-CN')}</small></span><i>↗</i></button>`;}).join(''):'<div class="history-empty">查过的示例好物，会在这里等你。</div>';}
-  function renderResult(r){
-    const p=r.status==='DEMO_RESULT'?r.product:null;
-    if(p){
-      $('#convert-result').innerHTML=`<div class="result-label"><span></span>示例结果 · 尚未连接真实联盟</div><div class="result-product"><img src="${productImage(p)}" alt="示例商品插画"><div><div class="product-origin">${badge(p.platform)} ${C.platformNames[p.platform]} / 示例商品</div><h3>${esc(p.title)}</h3><div class="coupon-row">${coupon(p)}</div><div class="product-price-row">${price(p)}</div></div></div><div class="result-facts"><div><span>识别平台</span><b>${C.platformNames[p.platform]}</b></div><div><span>推广链接</span><b class="status-unconnected">未接入，未生成</b></div></div><div class="result-actions"><button class="primary-button" id="copy-result">复制演示结果</button><button class="secondary-button" id="purchase-info">查看购买方式 ↗</button></div><p class="result-message">此结果使用演示商品和优惠。正式接入后，这里展示接口返回的真实券信息与推广链接。</p>`;
-      $('#copy-result').onclick=()=>copy(`[券省交互演示，不可用于购物]\n${p.title}\n${C.platformNames[p.platform]} · 示例券后价 ¥${C.money(C.finalPrice(p))}\n未生成真实优惠券或推广链接。`);
-      $('#purchase-info').onclick=()=>showDialog('购买方式 / 未接入','<h2>从这里，回到购物平台。</h2><p>正式接入后，网站展示联盟接口返回的推广链接或口令；小程序按实际授权返回的 appId、path 等数据，提供可用的跳转方式。</p><p>当前仅演示，尚未连接联盟账号，因此没有可购买的领券链接。</p>');
-      saveHistory(p);
-    }else{
-      $('#convert-result').innerHTML=`<div class="result-label"><span></span>已识别平台 · 尚未查询真实商品</div><h3 style="font-size:17px;margin:18px 0 8px">${badge(r.platform)} ${C.platformNames[r.platform]}${r.kind==='token'?'淘口令':'链接'}已识别</h3><p class="result-message">这不是内置示例。当前尚未接入${C.platformNames[r.platform]}联盟 API，无法查询此商品的标题、价格、优惠券或佣金，也未生成推广链接。</p><button class="secondary-button" data-example="${r.platform}" style="margin-top:18px">换用${C.platformNames[r.platform]}示例体验流程 →</button>`;
+
+  function detect() {
+    const text = $('#link-input').value;
+    const r = C.analyze(text);
+    $('#clear-link').hidden = !text;
+    $('#platform-detection').textContent = !text ? '等待粘贴链接' : r.error
+      ? '输入后点击识别' : `已识别：${C.platformNames[r.platform]}${r.kind === 'token' ? '淘口令' : ''}`;
+    $('#platform-detection').classList.toggle('detected', !r.error);
+  }
+
+  function loadHistory() {
+    try {
+      const data = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+      if (!Array.isArray(data)) return [];
+      return data.filter(i => i && typeof i.ref === 'string' && Number.isFinite(i.time)).slice(0, 5);
+    } catch { return []; }
+  }
+  function saveHistory(item) {
+    try {
+      const list = loadHistory().filter(i => i.ref !== item.productRef);
+      list.unshift({ ref: item.productRef, title: item.title, platform: item.platform, time: Date.now() });
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(list.slice(0, 5)));
+    } catch { toast('浏览器未允许保存本地记录'); }
+    renderHistory();
+  }
+  function renderHistory() {
+    const list = loadHistory();
+    $('#clear-history').hidden = !list.length;
+    $('#history-list').innerHTML = list.length
+      ? list.map(i => `<button class="history-row" data-history="${esc(i.ref)}"><span><b>${esc(i.title)}</b><small>${esc(C.platformNames[i.platform] || '淘宝')} · ${new Date(i.time).toLocaleDateString('zh-CN')}</small></span><i>↗</i></button>`).join('')
+      : '<div class="history-empty">查看过的商品会记录在这里（仅保存商品引用）。</div>';
+  }
+
+  async function convertLink(text) {
+    const result = await requestApi('/api/convert', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text })
+    });
+    if (!Object.hasOwn(C.platformNames, result.platform) ||
+        result.status !== 'UPSTREAM_NOT_CONNECTED' ||
+        result.product !== null || result.promotion !== null) {
+      throw new ApiError('BAD_SHAPE', '转链接口的返回不符合正式契约。', false);
     }
-    $('#convert-result').hidden=false;
-    $('#convert-result').scrollIntoView({behavior:'smooth',block:'nearest'});
+    return result;
   }
-  async function copy(text){try{if(!navigator.clipboard)throw new Error('Clipboard unavailable');await navigator.clipboard.writeText(text);toast('已复制演示内容；不含真实购物链接');}catch{showDialog('手动复制','<h2>长按或选中以下内容</h2><textarea readonly style="width:100%;min-height:180px;border:1px solid #e6ddcc;border-radius:8px;padding:12px;background:#fffdfa;color:#80725a">'+esc(text)+'</textarea>');}}
+
+  function renderResult(r) {
+    $('#convert-result').innerHTML = `
+      <div class="result-label"><span></span>已识别平台 · 正式转链待接入</div>
+      <h3 class="result-heading">${badge(r.platform)} ${esc(C.platformNames[r.platform])}${r.kind === 'token' ? '淘口令' : '链接'}已识别</h3>
+      <p class="result-message">${esc(r.notice || '本次仅识别链接所属平台。')}</p>
+      <div class="result-facts">
+        <div><span>识别平台</span><b>${esc(C.platformNames[r.platform])}</b></div>
+        <div><span>商品信息</span><b class="status-unconnected">未查询</b></div>
+        <div><span>推广链接</span><b class="status-unconnected">未生成</b></div>
+      </div>
+      <div class="result-actions"><button class="secondary-button" id="conversion-info">查看接入说明 ↗</button></div>
+      <p class="result-message">正式转链、领券与购买入口属于 /api/v1/conversions，本次范围外；京东、拼多多平台未开放。</p>`;
+    $('#conversion-info').onclick = () => showDialog('正式转链 / 待接入',
+      '<h2>现在只做平台识别。</h2><p>当前服务仅识别链接所属平台，不查询商品、优惠或佣金，也不生成任何推广链接。</p><p>正式转链需要账号权限核对、推广位配置和 /api/v1/conversions 实现；完成后这里才会出现可领券购买的入口。</p>');
+    $('#convert-result').hidden = false;
+    $('#convert-result').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  function guide() {
+    showDialog('QUANSHENG / 使用说明',
+      '<h2>先看真实商品，再等转链。</h2><ol><li><b>浏览真实商品</b><br>首页展示淘宝联盟实时返回的标题、主图、当前价与已知券信息。</li><li><b>理解价格口径</b><br>只有资格明确的到手价才标「到手价」；含凑单、满减等条件时显示「预估价」并列出条件。</li><li><b>链接识别</b><br>粘贴淘宝、京东或拼多多链接可识别平台，但暂不查询商品或生成推广链接。</li></ol><p>京东联盟、多多进宝尚未开放。优惠与资格以淘宝联盟返回及平台结算页为准；付款、物流与售后均在原购物平台完成。</p>');
+  }
+
+  async function showStatus() {
+    try {
+      const data = await requestApi('/api/v1/platforms');
+      const rows = data.platforms.map(p => `<li>${esc(p.name)}：${p.enabled ? '已接入（淘宝联盟实时数据）' : '未开放'}</li>`).join('');
+      showDialog('接入状态', `<h2>平台开放状态</h2><ul>${rows}</ul><p>当前数据源：${esc(dataSource || '加载中')}。正式转链 /api/v1/conversions 待接入。</p>`);
+    } catch (error) { toast(error.message); }
+  }
+
   $('#convert-form').onsubmit = async event => {
     event.preventDefault();
     const job = ++convertJob;
@@ -193,8 +339,7 @@
     $('#convert-result').hidden = true;
     input.removeAttribute('aria-invalid');
     button.disabled = true;
-    button.textContent = '正在查询演示结果…';
-
+    button.textContent = '正在识别平台…';
     try {
       const result = await convertLink(input.value);
       if (job === convertJob) renderResult(result);
@@ -204,49 +349,81 @@
       $('#input-error').hidden = false;
       if (C.analyze(input.value).error) input.setAttribute('aria-invalid', 'true');
     } finally {
-      if (job === convertJob) {
-        button.disabled = false;
-        button.innerHTML = '查找优惠，预览转链 <span>→</span>';
-      }
+      if (job === convertJob) { button.disabled = false; button.innerHTML = '识别链接平台 <span>→</span>'; }
     }
   };
+
   $('#link-input').oninput = resetConversion;
-  $('#clear-link').onclick=()=>{fillLink('');$('#link-input').focus();};
+  $('#clear-link').onclick = () => { fillLink(''); $('#link-input').focus(); };
   $('#search-form').onsubmit = event => {
     event.preventDefault();
     const text = $('#search-input').value.trim();
-    if (!text) {
-      toast('输入商品名称或粘贴商品链接');
-      $('#search-input').focus();
-      return;
-    }
-    if (/https?:\/\/|[￥¥]/i.test(text)) {
-      fillLink(text);
-      return;
-    }
+    if (!text) { toast('输入商品名称或粘贴商品链接'); $('#search-input').focus(); return; }
+    if (/https?:\/\/|[￥¥]/i.test(text)) { fillLink(text); return; }
     state.query = text;
     state.category = 'all';
     renderGoods();
     $('#goods-section').scrollIntoView({ behavior: 'smooth' });
   };
-  $('#sort-select').onchange=e=>{state.sort=e.target.value;renderGoods();};
-  function clearFilters(){Object.assign(state,{platform:'all',category:'all',query:'',sort:'recommend'});$('#sort-select').value='recommend';$('#search-input').value='';renderGoods();}
-  $('#clear-filter').onclick=clearFilters;$('#empty-reset').onclick=clearFilters;
-  $('#goods-retry').onclick = renderGoods;
-  $('#start-convert').onclick=()=>location.hash='convert';
-  $('#guide-button').onclick=guide;$('#footer-guide').onclick=guide;
-  $('#demo-info').onclick=()=>showDialog('当前版本 / 交互演示','<h2>把想法，先变成可体验的页面。</h2><p>你可以浏览示例好物，筛选平台与专题，粘贴链接识别平台，体验查券结果和双 Tab 手机布局。</p><p>商品、价格与优惠均为样例。真实查询、联盟转链、订单同步和佣金结算需要服务端以及三家联盟开通的应用权限。</p><p>本版本按“用户领券，平台赚佣金”设计，尚未涉及用户余额或提现。</p>');
-  $('#clear-history').onclick=()=>{try{localStorage.removeItem('quansheng.history.v1');}catch{}renderHistory();toast('已清空本设备记录');};
-  $('#dialog-close').onclick=()=>$('#dialog').close();
-  $('#dialog').onclick=e=>{if(e.target===$('#dialog')){const r=e.target.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)e.target.close();}};
-  document.addEventListener('click',e=>{
-    const product=e.target.closest('[data-product]');if(product){productDetail(product.dataset.product);return;}
-    const platform=e.target.closest('[data-platform]');if(platform){state.platform=platform.dataset.platform;renderGoods();return;}
-    const category=e.target.closest('[data-category]');if(category){state.category=category.dataset.category;renderGoods();return;}
-    const collection=e.target.closest('[data-collection]');if(collection){state.category=collection.dataset.collection;state.query='';state.platform='all';$('#search-input').value='';renderGoods();$('#goods-section').scrollIntoView({behavior:'smooth'});return;}
-    const search=e.target.closest('[data-search]');if(search){$('#search-input').value=search.dataset.search;$('#search-form').requestSubmit();return;}
-    const example=e.target.closest('[data-example]');if(example){fillLink(C.exampleUrl(example.dataset.example));$('#link-input').focus();return;}
-    const history=e.target.closest('[data-history]');if(history){fillLink(C.exampleUrl(history.dataset.history));$('#convert-form').requestSubmit();}
+  $('#sort-select').onchange = e => { state.sort = e.target.value; renderGoods(); };
+  function clearFilters() {
+    Object.assign(state, { platform: 'all', category: 'all', query: '', sort: 'recommend' });
+    $('#search-input').value = '';
+    renderGoods();
+  }
+  $('#clear-filter').onclick = clearFilters;
+  $('#empty-reset').onclick = clearFilters;
+  $('#goods-retry').onclick = () => renderGoods();
+  $('#load-more').onclick = () => renderGoods({ append: true });
+  $('#start-convert').onclick = () => { location.hash = 'convert'; };
+  $('#guide-button').onclick = guide;
+  $('#footer-guide').onclick = guide;
+  $('#status-info').onclick = showStatus;
+  $('#clear-history').onclick = () => {
+    try { localStorage.removeItem(HISTORY_KEY); } catch { /* storage disabled */ }
+    renderHistory();
+    toast('已清空本设备记录');
+  };
+  $('#dialog-close').onclick = () => $('#dialog').close();
+  $('#dialog').onclick = e => {
+    if (e.target === $('#dialog')) {
+      const r = e.target.getBoundingClientRect();
+      if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) e.target.close();
+    }
+  };
+
+  document.addEventListener('click', e => {
+    const product = e.target.closest('[data-product]');
+    if (product) { productDetail(product.dataset.product); return; }
+    const platform = e.target.closest('[data-platform]');
+    if (platform) {
+      if (platform.dataset.disabled === 'true') { toast('该平台未开放，当前仅接入淘宝联盟。'); return; }
+      state.platform = platform.dataset.platform;
+      renderGoods();
+      return;
+    }
+    const category = e.target.closest('[data-category]');
+    if (category) { state.category = category.dataset.category; state.query = ''; $('#search-input').value = ''; renderGoods(); return; }
+    const collection = e.target.closest('[data-collection]');
+    if (collection) {
+      Object.assign(state, { category: collection.dataset.collection, query: '', platform: 'all' });
+      $('#search-input').value = '';
+      renderGoods();
+      $('#goods-section').scrollIntoView({ behavior: 'smooth' });
+      return;
+    }
+    const search = e.target.closest('[data-search]');
+    if (search) { $('#search-input').value = search.dataset.search; $('#search-form').requestSubmit(); return; }
+    const history = e.target.closest('[data-history]');
+    if (history) productDetail(history.dataset.history);
   });
-  window.addEventListener('hashchange',route);renderGoods();renderHistory();route();
+
+  window.addEventListener('hashchange', route);
+  if (location.protocol === 'file:') {
+    showGoodsError(new ApiError('NETWORK', '请通过 npm start 启动服务后访问 http://localhost:3000，浏览器不能直接打开本地文件调用正式接口。', false));
+  } else {
+    renderGoods();
+  }
+  renderHistory();
+  route();
 })();

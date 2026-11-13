@@ -1,11 +1,11 @@
 {
-  "name":"quansheng-affiliate-prototype",
+  "name":"quansheng-affiliate-live",
   "private":true,
-  "version":"0.1.0",
-  "description":"券省网站与微信小程序起步工程；演示数据，未实现真实联盟适配器",
+  "version":"0.2.0",
+  "description":"券省网站与微信小程序：淘宝联盟实时商品（V1.2 契约）；京东、拼多多未开放，正式转链待接入",
   "scripts":{
     "start":"node server/server.cjs",
-    "test":"node --test server/core.test.cjs server/mini-api.test.cjs",
+    "test":"node --test server/core.test.cjs server/mini-api.test.cjs server/adapter.test.cjs server/catalog.test.cjs",
     "smoke":"node scripts/smoke.cjs"
   },
   "engines":{"node":">=22"}

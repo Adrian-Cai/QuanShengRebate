@@ -1,6 +1,22 @@
-<view class="page"><view class="intro"><text class="kicker">YOUR LITTLE SAVING HELPER</text><view>买之前，<text>查一下。</text></view><view class="subtitle">复制商品链接，让每一次下单更划算。</view></view>
-  <view class="card"><view class="card-title">↗ 链接查券工具 <text class="pill">自动识别平台</text></view><view class="label">商品链接或分享文案</view><textarea value="{{text}}" bindinput="onInput" maxlength="2000" placeholder="粘贴淘宝、京东或拼多多商品链接…"/><view class="input-tools"><text>{{detected}}</text><button bindtap="paste">粘贴</button><button bindtap="clear">清空</button></view><view class="error" wx:if="{{error}}">{{error}}</view><button class="primary" bindtap="convert" loading="{{busy}}" disabled="{{busy}}">查找优惠，预览转链 →</button><view class="examples"><text>试试示例</text><button data-platform="taobao" bindtap="example">淘宝</button><button data-platform="jd" bindtap="example">京东</button><button data-platform="pdd" bindtap="example">拼多多</button></view><view class="demo-note" wx:if="{{demo}}">交互演示 · 不生成真实推广链接。商品、价格与优惠均为样例。</view></view>
-  <view class="card result" wx:if="{{result}}"><view class="result-label">{{result.mode==='demo'?'演示结果 · 未接入联盟':'查询结果'}}</view><block wx:if="{{result.product}}"><view class="product-row"><image src="{{result.product.imagePath}}" mode="aspectFit"/><view><text class="platform-{{result.platform}}">{{result.platformName}} / 示例商品</text><view class="product-title">{{result.product.title}}</view><view class="price">¥{{result.product.priceLabel}}<text>券后</text></view><view class="coupon">券 ¥{{result.product.couponLabel}}</view></view></view><view class="actions"><button class="primary" wx:if="{{result.mode==='demo'}}" bindtap="copyDemo">复制演示结果</button><button class="secondary" bindtap="purchase">{{result.mode==='live'?'领券去购买 ↗':'查看购买方式 ↗'}}</button></view></block><view wx:else class="unknown"><view>{{result.platformName}}链接已识别</view><text>尚未连接联盟 API，无法查询这件商品的优惠信息，也未生成推广链接。</text></view></view>
-  <view class="history-heading">最近查过<button wx:if="{{history.length}}" bindtap="clearHistory">清空</button></view><view wx:if="{{!history.length}}" class="history-empty">查过的示例好物，会在这里等你。</view><button class="history-row" wx:for="{{history}}" wx:key="id" data-id="{{item.id}}" bindtap="previous"><image src="{{item.imagePath}}" mode="aspectFit"/><view>{{item.title}}<text>{{item.platformName}} · 演示记录</text></view><text>↗</text></button><view class="footnote">记录仅保存在本设备上，不代表已产生订单。</view>
-  <view class="how"><text class="kicker">HOW IT WORKS</text><view class="how-title">省钱，只需三步</view><view>① 复制商品分享链接</view><view>② 查询优惠并生成推广链接</view><view>③ 回原购物平台领券、下单</view><text>价格以结算页为准，付款与售后均在原平台进行。</text></view>
+<view class="page">
+  <view class="intro"><text class="kicker">YOUR LITTLE SAVING HELPER</text><view>买之前，<text>查一下。</text></view><view class="subtitle">当前仅识别链接所属平台，正式转链待接入。</view></view>
+  <view class="card">
+    <view class="card-title">↗ 链接识别 <text class="pill">自动识别平台</text></view>
+    <view class="label">商品链接或分享文案</view>
+    <textarea value="{{text}}" bindinput="onInput" maxlength="2000" placeholder="粘贴淘宝、京东或拼多多商品链接…"/>
+    <view class="input-tools"><text>{{detected}}</text><button bindtap="paste">粘贴</button><button bindtap="clear">清空</button></view>
+    <view class="error" wx:if="{{error}}">{{error}}</view>
+    <button class="primary" bindtap="convert" loading="{{busy}}" disabled="{{busy}}">识别链接平台 →</button>
+    <view class="status-notice"><text>ⓘ</text><view>正式转链 /api/v1/conversions 待接入：不查询商品、不生成推广链接。京东、拼多多平台未开放。</view></view>
+  </view>
+  <view class="card result" wx:if="{{result}}">
+    <view class="result-label">已识别平台 · 正式转链待接入</view>
+    <view class="unknown">
+      <view>{{result.platformName}}{{result.kind === 'token' ? '淘口令' : '链接'}}已识别</view>
+      <text>{{result.notice || '本次仅识别链接所属平台。'}}</text>
+    </view>
+    <view class="facts"><view><text>识别平台</text><text class="fact-value">{{result.platformName}}</text></view><view><text>商品信息</text><text class="fact-value">未查询</text></view><view><text>推广链接</text><text class="fact-value">未生成</text></view></view>
+    <button class="secondary" bindtap="info">查看接入说明 ↗</button>
+  </view>
+  <view class="how"><text class="kicker">HOW IT WORKS</text><view class="how-title">当前能做什么</view><view>① 首页浏览淘宝联盟实时商品</view><view>② 看清当前价、券条件与到手价口径</view><view>③ 粘贴链接识别所属平台</view><text>正式转链、领券与购买入口待接入；价格以平台结算页为准。</text></view>
 </view>

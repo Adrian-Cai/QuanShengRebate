@@ -13,7 +13,7 @@
     "borderStyle": "white",
     "list": [
       {"pagePath":"pages/home/index","text":"首页","iconPath":"assets/home.png","selectedIconPath":"assets/home-active.png"},
-      {"pagePath":"pages/convert/index","text":"转链查券","iconPath":"assets/link.png","selectedIconPath":"assets/link-active.png"}
+      {"pagePath":"pages/convert/index","text":"链接识别","iconPath":"assets/link.png","selectedIconPath":"assets/link-active.png"}
     ]
   },
   "style": "v2",

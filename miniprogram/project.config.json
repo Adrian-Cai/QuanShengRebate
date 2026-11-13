@@ -1,5 +1,5 @@
 {
-  "description": "券省微信小程序：双 Tab 交互起步工程。默认使用示例数据，未连接联盟。",
+  "description": "券省微信小程序：读取 /api/v1/products 的淘宝联盟实时商品；需在 app.js 配置 apiBase（真机为 HTTPS 合法域名），并在小程序后台配置外链主图的 downloadFile 合法域名。",
   "projectname": "quansheng-mini",
   "appid": "touristappid",
   "compileType": "miniprogram",
